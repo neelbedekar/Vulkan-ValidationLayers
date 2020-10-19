@@ -2528,7 +2528,11 @@ void ResourceAccessState::SetWrite(SyncStageAccessFlagBits usage_bit, const Reso
 void ResourceAccessState::ApplyBarrier(const SyncBarrier &barrier, bool layout_transition) {
     // For independent barriers we need to track what the new barriers and dependency chain *will* be when we're done
     // applying the memory barriers
-    if (InSourceScopeOrChain(barrier.src_exec_scope, barrier.src_access_scope)) {
+    // NOTE: We update the write barrier if the write is in the first access scope or if there is a layout
+    //       transistion, under the theory of "most recent access".  If the read/write *isn't* safe
+    //       vs. this layout transition DetectBarrierHazard should report it.  We treat the layout
+    //       transistion *as* a write and in scope with the barrier (it's before visibility).
+    if (layout_transition || InSourceScopeOrChain(barrier.src_exec_scope, barrier.src_access_scope)) {
         pending_write_barriers |= barrier.dst_access_scope;
         pending_write_dep_chain |= barrier.dst_exec_scope;
     }
