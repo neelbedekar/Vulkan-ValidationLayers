@@ -112,6 +112,7 @@ struct SyncBarrier {
           src_access_scope(src_access_scope_),
           dst_exec_scope(dst_exec_scope_),
           dst_access_scope(dst_access_scope_) {}
+    SyncBarrier(const SyncBarrier &other) = default;
 };
 
 // To represent ordering guarantees such as rasterization and store
@@ -131,13 +132,25 @@ class ResourceAccessState : public SyncStageAccess {
     struct ReadState {
         VkPipelineStageFlagBits stage;  // The stage of this read
         SyncStageAccessFlags access;    // TODO: Change to FlagBits when we have a None bit enum
+                                        // TODO: Revisit whether this needs to support multiple reads per stage
         VkPipelineStageFlags barriers;  // all applicable barriered stages
         ResourceUsageTag tag;
+        VkPipelineStageFlags pending_dep_chain;  // Should be zero except during barrier application
+                                                 // Excluded from comparison
+        ReadState() = default;
         bool operator==(const ReadState &rhs) const {
             bool same = (stage == rhs.stage) && (access == rhs.access) && (barriers == rhs.barriers) && (tag == rhs.tag);
             return same;
         }
         bool operator!=(const ReadState &rhs) const { return !(*this == rhs); }
+        inline void Set(VkPipelineStageFlagBits stage_, SyncStageAccessFlags access_, VkPipelineStageFlags barriers_,
+                        const ResourceUsageTag &tag_) {
+            stage = stage_;
+            access = access_;
+            barriers = barriers_;
+            tag = tag_;
+            pending_dep_chain = 0;  // If this is a new read, we aren't applying a barrier set.
+        }
     };
 
   public:
@@ -149,33 +162,37 @@ class ResourceAccessState : public SyncStageAccess {
     HazardResult DetectAsyncHazard(SyncStageAccessIndex usage_index) const;
 
     void Update(SyncStageAccessIndex usage_index, const ResourceUsageTag &tag);
+    void SetWrite(SyncStageAccessFlagBits usage_bit, const ResourceUsageTag &tag);
     void Resolve(const ResourceAccessState &other);
-    void ApplyBarriers(const std::vector<SyncBarrier> &barriers);
-    void ApplyExecutionBarrier(VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask);
-    void ApplyExecutionBarriers(const std::vector<SyncBarrier> &barriers);
-    void ApplyMemoryAccessBarrier(bool multi_dep, VkPipelineStageFlags src_stage_mask, SyncStageAccessFlags src_scope,
-                                  VkPipelineStageFlags dst_stage_mask, SyncStageAccessFlags dst_scope);
+    void ApplyBarriers(const std::vector<SyncBarrier> &barriers, bool layout_transition);
+    void ApplyBarriers(const std::vector<SyncBarrier> &barriers, const ResourceUsageTag &tag);
+    void ApplyBarrier(const SyncBarrier &barrier, bool layout_transition);
+    void ApplyPendingBarriers(const ResourceUsageTag &tag);
 
     ResourceAccessState()
         : write_barriers(~SyncStageAccessFlags(0)),
           write_dependency_chain(0),
           write_tag(),
           last_write(0),
-          input_attachment_barriers(kNoAttachmentRead),
-          input_attachment_tag(),
+          input_attachment_read(false),
           last_read_count(0),
           last_read_stages(0),
-          read_execution_barriers(0) {}
+          read_execution_barriers(0),
+          pending_write_dep_chain(0),
+          pending_layout_transition(false),
+          pending_write_barriers(0) {}
 
+    bool HasPendingState() const {
+        return (0 != pending_layout_transition) || (0 != pending_write_barriers) || (0 != pending_write_dep_chain);
+    }
     bool HasWriteOp() const { return last_write != 0; }
     bool operator==(const ResourceAccessState &rhs) const {
         bool same = (write_barriers == rhs.write_barriers) && (write_dependency_chain == rhs.write_dependency_chain) &&
                     (last_read_count == rhs.last_read_count) && (last_read_stages == rhs.last_read_stages) &&
-                    (write_tag == rhs.write_tag) && (input_attachment_barriers == rhs.input_attachment_barriers) &&
-                    ((input_attachment_barriers == kNoAttachmentRead) || input_attachment_tag == rhs.input_attachment_tag) &&
+                    (write_tag == rhs.write_tag) && (input_attachment_read == rhs.input_attachment_read) &&
                     (read_execution_barriers == rhs.read_execution_barriers);
         for (uint32_t i = 0; same && i < last_read_count; i++) {
-            same |= last_reads[i] == rhs.last_reads[i];
+            same &= last_reads[i] == rhs.last_reads[i];
         }
         return same;
     }
@@ -184,8 +201,9 @@ class ResourceAccessState : public SyncStageAccess {
     SyncStageAccessFlags GetWriteBarriers() const { return write_barriers; }
 
   private:
-    static constexpr VkPipelineStageFlags kNoAttachmentRead = ~VkPipelineStageFlags(0);
+    static constexpr VkPipelineStageFlags kInvalidAttachmentStage = ~VkPipelineStageFlags(0);
     bool IsWriteHazard(SyncStageAccessFlagBits usage) const { return 0 != (usage & ~write_barriers); }
+    bool IsRAWHazard(VkPipelineStageFlagBits usage_stage, SyncStageAccessFlagBits usage) const;
     bool InSourceScopeOrChain(VkPipelineStageFlags src_exec_scope, SyncStageAccessFlags src_access_scope) const {
         return (src_access_scope & last_write) || (write_dependency_chain & src_exec_scope);
     }
@@ -203,6 +221,8 @@ class ResourceAccessState : public SyncStageAccess {
     bool IsReadHazard(VkPipelineStageFlags stage_mask, const ReadState &read_access) const {
         return IsReadHazard(stage_mask, read_access.barriers);
     }
+    VkPipelineStageFlags GetOrderedStages(const SyncOrderingBarrier &ordering) const;
+    ReadState *GetReadStateForStage(VkPipelineStageFlagBits stage, uint32_t search_limit = kStageCount);
 
     // TODO: Add a NONE (zero) enum to SyncStageAccessFlagBits for input_attachment_read and last_write
 
@@ -214,18 +234,20 @@ class ResourceAccessState : public SyncStageAccess {
     ResourceUsageTag write_tag;
     SyncStageAccessFlags last_write;  // only the most recent write
 
-    // This is special as it's a framebuffer-local read from a framebuffer-global pipeline stage
-    // As the only possible state for the input attachment stage/access is SYNC_FRAGMENT_SHADER_INPUT_ATTACHMENT_READ_BIT,
-    // encode the presence with the barriers mask, ~0 denotes no pending input attachment. Zero -- is the no-barrier state,
-    // otherwise reflects the barrier/dependency chain information.
-    VkPipelineStageFlags input_attachment_barriers;
-    ResourceUsageTag input_attachment_tag;
+    // TODO Input Attachment cleanup for multiple reads in a given stage
+    // Tracks whether the fragment shader read is input attachment read
+    bool input_attachment_read;
 
     uint32_t last_read_count;
     VkPipelineStageFlags last_read_stages;
     VkPipelineStageFlags read_execution_barriers;
     static constexpr size_t kStageCount = 32;  // TODO: The manual count was 28 real stages. Add stage count to codegen
     std::array<ReadState, kStageCount> last_reads;
+
+    // Pending execution state to support independent parallel barriers
+    VkPipelineStageFlags pending_write_dep_chain;
+    bool pending_layout_transition;
+    SyncStageAccessFlags pending_write_barriers;
 };
 
 using ResourceAccessRangeMap = sparse_container::range_map<VkDeviceSize, ResourceAccessState>;
@@ -240,6 +262,9 @@ class AccessContext {
         kDetectAsync = 1U << 1,
         kDetectAll = (kDetectPrevious | kDetectAsync)
     };
+    constexpr static int kAddressTypeCount = AddressType::kMaxAddressType + 1;
+    static const std::array<AddressType, kAddressTypeCount> kAddressTypes;
+    using MapArray = std::array<ResourceAccessRangeMap, kAddressTypeCount>;
 
     // WIP TODO WIP Multi-dep -- change track back to support barrier vector, not just last.
     struct TrackBack {
@@ -281,6 +306,9 @@ class AccessContext {
                                           SyncStageAccessFlags src_stage_accesses, const VkImageMemoryBarrier &barrier) const;
     HazardResult DetectSubpassTransitionHazard(const TrackBack &track_back, const IMAGE_VIEW_STATE *attach_view) const;
 
+    void RecordLayoutTransitions(const RENDER_PASS_STATE &rp_state, uint32_t subpass,
+                                 const std::vector<const IMAGE_VIEW_STATE *> &attachment_views, const ResourceUsageTag &tag);
+
     const TrackBack &GetDstExternalTrackBack() const { return dst_external_; }
     void Reset() {
         prev_.clear();
@@ -292,16 +320,22 @@ class AccessContext {
             map.clear();
         }
     }
+
+    // Follow the context previous to access the access state, supporting "lazy" import into the context. Not intended for
+    // subpass layout transition, as the pending state handling is more complex
     // TODO: See if returning the lower_bound would be useful from a performance POV -- look at the lower_bound overhead
     // Would need to add a "hint" overload to parallel_iterator::invalidate_[AB] call, if so.
     void ResolvePreviousAccess(AddressType type, const ResourceAccessRange &range, ResourceAccessRangeMap *descent_map,
                                const ResourceAccessState *infill_state) const;
-    void ResolvePreviousAccess(const IMAGE_STATE &image_state, const VkImageSubresourceRange &subresource_range,
-                               AddressType address_type, ResourceAccessRangeMap *descent_map,
-                               const ResourceAccessState *infill_state) const;
-    void ResolveAccessRange(AddressType type, const ResourceAccessRange &range, const std::vector<SyncBarrier> &barriers,
+    template <typename BarrierAction>
+    void ResolveAccessRange(const IMAGE_STATE &image_state, const VkImageSubresourceRange &subresource_range,
+                            BarrierAction &barrier_action, AddressType address_type, ResourceAccessRangeMap *descent_map,
+                            const ResourceAccessState *infill_state) const;
+    template <typename BarrierAction>
+    void ResolveAccessRange(AddressType type, const ResourceAccessRange &range, BarrierAction &barrier_action,
                             ResourceAccessRangeMap *resolve_map, const ResourceAccessState *infill_state,
                             bool recur_to_infill = true) const;
+
     void UpdateAccessState(const BUFFER_STATE &buffer, SyncStageAccessIndex current_usage, const ResourceAccessRange &range,
                            const ResourceUsageTag &tag);
     void UpdateAccessState(const IMAGE_STATE &image, SyncStageAccessIndex current_usage,
@@ -321,26 +355,15 @@ class AccessContext {
 
     void ResolveChildContexts(const std::vector<AccessContext> &contexts);
 
-    void ApplyImageBarrier(const IMAGE_STATE &image, VkPipelineStageFlags src_exec_scope, SyncStageAccessFlags src_access_scope,
-                           VkPipelineStageFlags dst_exec_scope, SyncStageAccessFlags dst_accesse_scope,
-                           const VkImageSubresourceRange &subresource_range);
-
-    void ApplyImageBarrier(const IMAGE_STATE &image, VkPipelineStageFlags src_exec_scope, SyncStageAccessFlags src_access_scope,
-                           VkPipelineStageFlags dst_exec_scope, SyncStageAccessFlags dst_access_scope,
-                           const VkImageSubresourceRange &subresource_range, bool layout_transition, const ResourceUsageTag &tag);
-    void ApplyImageBarrier(const IMAGE_STATE &image, const SyncBarrier &barrier, const VkImageSubresourceRange &subresource_range,
-                           bool layout_transition, const ResourceUsageTag &tag);
-
     template <typename Action>
-    void UpdateMemoryAccess(const BUFFER_STATE &buffer, const ResourceAccessRange &range, const Action action);
+    void UpdateResourceAccess(const BUFFER_STATE &buffer, const ResourceAccessRange &range, const Action action);
     template <typename Action>
-    void UpdateMemoryAccess(const IMAGE_STATE &image, const VkImageSubresourceRange &subresource_range, const Action action);
+    void UpdateResourceAccess(const IMAGE_STATE &image, const VkImageSubresourceRange &subresource_range, const Action action);
 
     template <typename Action>
     void ApplyGlobalBarriers(const Action &barrier_action);
 
     static AddressType ImageAddressType(const IMAGE_STATE &image);
-    static VkDeviceSize ResourceBaseAddress(const BINDABLE &bindable);
 
     AccessContext(uint32_t subpass, VkQueueFlags queue_flags, const std::vector<SubpassDependencyGraphNode> &dependencies,
                   const std::vector<AccessContext> &contexts, const AccessContext *external_context);
@@ -396,9 +419,8 @@ class AccessContext {
     HazardResult DetectPreviousHazard(AddressType type, const Detector &detector, const ResourceAccessRange &range) const;
     void UpdateAccessState(AddressType type, SyncStageAccessIndex current_usage, const ResourceAccessRange &range,
                            const ResourceUsageTag &tag);
-    constexpr static int kAddressTypeCount = AddressType::kMaxAddressType + 1;
-    static const std::array<AddressType, kAddressTypeCount> kAddressTypes;
-    std::array<ResourceAccessRangeMap, kAddressTypeCount> access_state_maps_;
+
+    MapArray access_state_maps_;
     std::vector<TrackBack> prev_;
     std::vector<TrackBack *> prev_by_subpass_;
     std::vector<AccessContext *> async_;
@@ -546,7 +568,7 @@ class SyncValidator : public ValidationStateTracker, public SyncStageAccess {
 
     void ApplyGlobalBarriers(AccessContext *context, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
                              SyncStageAccessFlags src_stage_scope, SyncStageAccessFlags dst_stage_scope,
-                             uint32_t memoryBarrierCount, const VkMemoryBarrier *pMemoryBarriers);
+                             uint32_t memoryBarrierCount, const VkMemoryBarrier *pMemoryBarriers, const ResourceUsageTag &tag);
     void ApplyBufferBarriers(AccessContext *context, VkPipelineStageFlags src_stage_mask, SyncStageAccessFlags src_stage_scope,
                              VkPipelineStageFlags dst_stage_mask, SyncStageAccessFlags dst_stage_scope, uint32_t barrier_count,
                              const VkBufferMemoryBarrier *barriers);

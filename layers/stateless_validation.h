@@ -31,18 +31,18 @@
 #define DECORATE_UNUSED
 #endif
 
-static const char DECORATE_UNUSED *kVUID_PVError_NONE = "UNASSIGNED-GeneralParameterError-Info";
-static const char DECORATE_UNUSED *kVUID_PVError_InvalidUsage = "UNASSIGNED-GeneralParameterError-InvalidUsage";
-static const char DECORATE_UNUSED *kVUID_PVError_InvalidStructSType = "UNASSIGNED-GeneralParameterError-InvalidStructSType";
-static const char DECORATE_UNUSED *kVUID_PVError_InvalidStructPNext = "UNASSIGNED-GeneralParameterError-InvalidStructPNext";
 static const char DECORATE_UNUSED *kVUID_PVError_RequiredParameter = "UNASSIGNED-GeneralParameterError-RequiredParameter";
-static const char DECORATE_UNUSED *kVUID_PVError_ReservedParameter = "UNASSIGNED-GeneralParameterError-ReservedParameter";
 static const char DECORATE_UNUSED *kVUID_PVError_UnrecognizedValue = "UNASSIGNED-GeneralParameterError-UnrecognizedValue";
-static const char DECORATE_UNUSED *kVUID_PVError_DeviceLimit = "UNASSIGNED-GeneralParameterError-DeviceLimit";
-static const char DECORATE_UNUSED *kVUID_PVError_DeviceFeature = "UNASSIGNED-GeneralParameterError-DeviceFeature";
-static const char DECORATE_UNUSED *kVUID_PVError_FailureCode = "UNASSIGNED-GeneralParameterError-FailureCode";
 static const char DECORATE_UNUSED *kVUID_PVError_ExtensionNotEnabled = "UNASSIGNED-GeneralParameterError-ExtensionNotEnabled";
 static const char DECORATE_UNUSED *kVUID_PVError_ApiVersionViolation = "UNASSIGNED-API-Version-Violation";
+// static const char DECORATE_UNUSED *kVUID_PVError_InvalidStructPNext = "UNASSIGNED-GeneralParameterError-InvalidStructPNext";
+// static const char DECORATE_UNUSED *kVUID_PVError_NONE = "UNASSIGNED-GeneralParameterError-Info";
+// static const char DECORATE_UNUSED *kVUID_PVError_InvalidUsage = "UNASSIGNED-GeneralParameterError-InvalidUsage";
+// static const char DECORATE_UNUSED *kVUID_PVError_InvalidStructSType = "UNASSIGNED-GeneralParameterError-InvalidStructSType";
+// static const char DECORATE_UNUSED *kVUID_PVError_ReservedParameter = "UNASSIGNED-GeneralParameterError-ReservedParameter";
+// static const char DECORATE_UNUSED *kVUID_PVError_DeviceLimit = "UNASSIGNED-GeneralParameterError-DeviceLimit";
+// static const char DECORATE_UNUSED *kVUID_PVError_FailureCode = "UNASSIGNED-GeneralParameterError-FailureCode";
+// static const char DECORATE_UNUSED *kVUID_PVError_DeviceFeature = "UNASSIGNED-GeneralParameterError-DeviceFeature";
 
 extern const uint32_t GeneratedVulkanHeaderVersion;
 
@@ -145,7 +145,8 @@ class StatelessValidation : public ValidationObject {
 
         if (value <= lower_bound) {
             std::ostringstream ss;
-            ss << api_name << ": parameter " << parameter_name.get_name() << " (= " << value << ") is not greater than " << lower_bound;
+            ss << api_name << ": parameter " << parameter_name.get_name() << " (= " << value << ") is not greater than "
+               << lower_bound;
             skip_call |= LogError(device, vuid, "%s", ss.str().c_str());
         }
 
@@ -463,9 +464,8 @@ class StatelessValidation : public ValidationObject {
             // Verify that strings in the array are not NULL
             for (uint32_t i = 0; i < count; ++i) {
                 if (array[i] == NULL) {
-                    skip_call |=
-                        LogError(device, kVUID_PVError_RequiredParameter, "%s: required parameter %s[%d] specified as NULL",
-                                 apiName, arrayName.get_name().c_str(), i);
+                    skip_call |= LogError(device, array_required_vuid, "%s: required parameter %s[%d] specified as NULL", apiName,
+                                          arrayName.get_name().c_str(), i);
                 }
             }
         }
@@ -521,22 +521,11 @@ class StatelessValidation : public ValidationObject {
                 const VkStructureType *end = allowed_types + allowed_type_count;
                 const VkBaseOutStructure *current = reinterpret_cast<const VkBaseOutStructure *>(next);
 
-                cycle_check.insert(next);
-
                 while (current != NULL) {
                     if (((strncmp(api_name, "vkCreateInstance", strlen(api_name)) != 0) ||
                          (current->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO)) &&
                         ((strncmp(api_name, "vkCreateDevice", strlen(api_name)) != 0) ||
                          (current->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO))) {
-                        if (cycle_check.find(current->pNext) != cycle_check.end()) {
-                            std::string message = "%s: %s chain contains a cycle -- pNext pointer %" PRIx64 " is repeated.";
-                            skip_call |= LogError(device, kVUID_PVError_InvalidStructPNext, message.c_str(), api_name,
-                                                  parameter_name.get_name().c_str(), reinterpret_cast<uint64_t>(next));
-                            break;
-                        } else {
-                            cycle_check.insert(current->pNext);
-                        }
-
                         std::string type_name = string_VkStructureType(current->sType);
                         if (unique_stype_check.find(current->sType) != unique_stype_check.end()) {
                             // stype_vuid will only be null if there are no listed pNext and will hit disclaimer check
